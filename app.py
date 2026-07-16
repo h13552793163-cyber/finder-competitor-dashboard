@@ -20,7 +20,7 @@ st.set_page_config(
 
 st.title("Finder Competitor Content Intelligence Dashboard")
 st.caption(
-    "Reusable prototype: collect YouTube data through API, upload raw platform exports, "
+    "Reusable prototype: collect YouTube data through API Search, upload raw platform exports, "
     "upload prepared competitor workbooks, analyse comments, and generate competitor comparison outputs."
 )
 
@@ -30,13 +30,6 @@ st.caption(
 # =========================================================
 
 def get_secret_api_key():
-    """
-    Priority:
-    1. Streamlit Cloud secrets
-    2. Local environment variable
-
-    The secret key is NOT displayed in the sidebar input.
-    """
     try:
         if "YOUTUBE_API_KEY" in st.secrets:
             return st.secrets["YOUTUBE_API_KEY"]
@@ -51,7 +44,7 @@ def get_secret_api_key():
 
 
 # =========================================================
-# 2. General helper functions
+# 2. General helpers
 # =========================================================
 
 def safe_lower(text):
@@ -59,9 +52,6 @@ def safe_lower(text):
 
 
 def parse_number(value):
-    """
-    Handles values like 725.1k, 1.20M, 16700, 16.7K.
-    """
     if pd.isna(value):
         return 0
 
@@ -86,10 +76,6 @@ def parse_number(value):
 
 
 def parse_percent(value):
-    """
-    Handles 1.84%, 1.84, 0.0184.
-    Returns percentage number, e.g. 1.84.
-    """
     if pd.isna(value):
         return None
 
@@ -148,14 +134,6 @@ def infer_platform_from_filename(filename):
 
 
 def parse_youtube_accounts(text):
-    """
-    Expected format:
-    Competitor Name | YouTube URL or handle
-
-    Example:
-    Nischa | https://www.youtube.com/@nischa
-    Damien Talks Money | https://www.youtube.com/@DamienTalksMoney
-    """
     accounts = []
 
     for line in str(text).splitlines():
@@ -165,23 +143,14 @@ def parse_youtube_accounts(text):
 
         if "|" in line:
             name, url = line.split("|", 1)
-            name = name.strip()
-            url = url.strip()
-
-            if not name or not url:
-                accounts.append({
-                    "competitor": name if name else line,
-                    "youtube_input": ""
-                })
-            else:
-                accounts.append({
-                    "competitor": name,
-                    "youtube_input": url
-                })
+            accounts.append({
+                "competitor": name.strip(),
+                "youtube_input": url.strip()
+            })
         else:
             accounts.append({
-                "competitor": line,
-                "youtube_input": line
+                "competitor": line.strip(),
+                "youtube_input": line.strip()
             })
 
     return accounts
@@ -215,6 +184,11 @@ def extract_channel_id_or_handle(channel_input: str):
 
 
 def resolve_youtube_channel_id(channel_input: str, api_key: str):
+    """
+    Resolve channel ID.
+    For @handles, use channels.list(forHandle=...) first to avoid wrong search results.
+    If that fails, fallback to search.list.
+    """
     parsed = extract_channel_id_or_handle(channel_input)
 
     if parsed["type"] == "empty":
@@ -223,18 +197,39 @@ def resolve_youtube_channel_id(channel_input: str, api_key: str):
     if parsed["type"] == "channel_id":
         return parsed["value"], None
 
-    query = parsed["value"]
+    if parsed["type"] == "handle":
+        handle = parsed["value"]
 
-    url = "https://www.googleapis.com/youtube/v3/search"
-    params = {
+        channel_url = "https://www.googleapis.com/youtube/v3/channels"
+        channel_params = {
+            "part": "snippet,statistics,contentDetails",
+            "forHandle": handle,
+            "key": api_key
+        }
+
+        response = requests.get(channel_url, params=channel_params, timeout=20)
+        data = response.json()
+
+        if response.status_code == 200:
+            items = data.get("items", [])
+            if items:
+                return items[0]["id"], None
+
+        # fallback: search exact handle text without @
+        query = handle.replace("@", "")
+    else:
+        query = parsed["value"]
+
+    search_url = "https://www.googleapis.com/youtube/v3/search"
+    search_params = {
         "part": "snippet",
         "q": query,
         "type": "channel",
-        "maxResults": 1,
+        "maxResults": 5,
         "key": api_key
     }
 
-    response = requests.get(url, params=params, timeout=20)
+    response = requests.get(search_url, params=search_params, timeout=20)
     data = response.json()
 
     if response.status_code != 200:
@@ -244,68 +239,52 @@ def resolve_youtube_channel_id(channel_input: str, api_key: str):
     if not items:
         return None, f"No YouTube channel found for: {channel_input}"
 
-    return items[0]["snippet"]["channelId"], None
+    # Prefer exact-ish channel title / handle match
+    query_clean = query.lower().replace("@", "").replace(" ", "")
+    best_item = items[0]
 
+    for item in items:
+        title = item.get("snippet", {}).get("channelTitle", "")
+        title_clean = title.lower().replace(" ", "")
+        if query_clean in title_clean or title_clean in query_clean:
+            best_item = item
+            break
 
-def get_uploads_playlist_id(channel_id: str, api_key: str):
-    """
-    Get the uploads playlist ID for a YouTube channel.
-    This is more reliable than search.list for collecting channel videos.
-    """
-    url = "https://www.googleapis.com/youtube/v3/channels"
-    params = {
-        "part": "contentDetails",
-        "id": channel_id,
-        "key": api_key
-    }
-
-    response = requests.get(url, params=params, timeout=20)
-    data = response.json()
-
-    if response.status_code != 200:
-        raise RuntimeError(data.get("error", {}).get("message", "YouTube API error."))
-
-    items = data.get("items", [])
-    if not items:
-        return None
-
-    return items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
+    return best_item["snippet"]["channelId"], None
 
 
 def fetch_youtube_recent_videos(
     channel_id: str,
     api_key: str,
-    days: int = 90,
+    days: int = 180,
     max_results: int = 50,
-    exclude_shorts: bool = True
+    include_shorts: bool = True
 ):
     """
-    Fetch recent uploads from a YouTube channel using the channel uploads playlist.
-    This is more stable than search.list and avoids wrong search results.
+    Fetch recent videos using YouTube search.list restricted by channelId.
+    This version is search-based, as requested.
     """
-    uploads_playlist_id = get_uploads_playlist_id(channel_id, api_key)
-
-    if not uploads_playlist_id:
-        return pd.DataFrame()
-
-    cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
+    published_after = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
     video_ids = []
     next_page_token = None
 
     while len(video_ids) < max_results:
-        playlist_url = "https://www.googleapis.com/youtube/v3/playlistItems"
-        playlist_params = {
-            "part": "snippet,contentDetails",
-            "playlistId": uploads_playlist_id,
+        search_url = "https://www.googleapis.com/youtube/v3/search"
+        search_params = {
+            "part": "snippet",
+            "channelId": channel_id,
+            "type": "video",
+            "order": "date",
+            "publishedAfter": published_after,
             "maxResults": min(50, max_results - len(video_ids)),
             "key": api_key
         }
 
         if next_page_token:
-            playlist_params["pageToken"] = next_page_token
+            search_params["pageToken"] = next_page_token
 
-        response = requests.get(playlist_url, params=playlist_params, timeout=20)
+        response = requests.get(search_url, params=search_params, timeout=20)
         data = response.json()
 
         if response.status_code != 200:
@@ -315,35 +294,13 @@ def fetch_youtube_recent_videos(
         if not items:
             break
 
-        stop_due_to_date = False
-
         for item in items:
-            snippet = item.get("snippet", {})
-            content = item.get("contentDetails", {})
-
-            published_at = snippet.get("publishedAt", "")
-
-            try:
-                published_dt = datetime.fromisoformat(
-                    published_at.replace("Z", "+00:00")
-                )
-            except Exception:
-                published_dt = None
-
-            if published_dt and published_dt < cutoff_date:
-                stop_due_to_date = True
-                continue
-
-            video_id = content.get("videoId")
+            video_id = item.get("id", {}).get("videoId")
             if video_id:
                 video_ids.append(video_id)
 
-            if len(video_ids) >= max_results:
-                break
-
         next_page_token = data.get("nextPageToken")
-
-        if not next_page_token or stop_due_to_date:
+        if not next_page_token:
             break
 
     if not video_ids:
@@ -380,7 +337,7 @@ def fetch_youtube_recent_videos(
             except Exception:
                 duration_seconds = 0
 
-            if exclude_shorts and duration_seconds <= 60:
+            if not include_shorts and duration_seconds <= 60:
                 continue
 
             rows.append({
@@ -521,7 +478,7 @@ def classify_topic(text):
         return "BNPL / Payments"
     if any(k in t for k in ["deal", "promo", "bonus", "offer", "free money", "discount"]):
         return "Rewards / Deals"
-    if any(k in t for k in ["podcast", "collab", "collaboration", "interview"]):
+    if any(k in t for k in ["podcast", "collab", "collaboration", "interview", "double take"]):
         return "Podcast / Collab"
 
     return "General Personal Finance"
@@ -539,6 +496,9 @@ def classify_format(platform, title, duration_seconds=None):
             return "Reel"
         return "Post"
 
+    if any(k in t for k in ["shorts", "#shorts"]):
+        return "Short video"
+
     if any(k in t for k in ["review", "is it worth"]):
         return "Product Review"
     if any(k in t for k in [" vs ", "compare", "comparison", "best "]):
@@ -549,13 +509,17 @@ def classify_format(platform, title, duration_seconds=None):
         return "Offer-led"
 
     if duration_seconds is not None:
-        if duration_seconds <= 60:
-            return "Short video"
-        if duration_seconds <= 180:
-            return "Short / Under 3 mins"
-        if duration_seconds <= 600:
-            return "Medium / 3–10 mins"
-        return "Long-form video"
+        try:
+            duration_seconds = float(duration_seconds)
+            if duration_seconds <= 60:
+                return "Short video"
+            if duration_seconds <= 180:
+                return "Short / Under 3 mins"
+            if duration_seconds <= 600:
+                return "Medium / 3–10 mins"
+            return "Long-form video"
+        except Exception:
+            pass
 
     return "General Video"
 
@@ -600,60 +564,48 @@ def classify_er_tier(platform, er_percent):
 
 
 # =========================================================
-# 5. Raw platform export standardisation
+# 5. Standardisation
 # =========================================================
 
 def standardise_platform_export(df, competitor_name="Uploaded Competitor", fallback_platform="Uploaded"):
-    """
-    Handles raw TikTok / Instagram / other platform export files.
-    One row = one post/video.
-    """
     df = df.copy()
 
     rename_map = {
         "Competitor": "Competitor",
         "competitor": "Competitor",
-
         "Platform": "Platform",
         "platform": "Platform",
-
         "Video title": "Title / Description",
         "Title": "Title / Description",
         "Description": "Title / Description",
         "Caption": "Title / Description",
         "caption": "Title / Description",
         "Title / Description": "Title / Description",
-
         "Post URL": "Post URL / Thread",
         "Video link": "Post URL / Thread",
         "URL": "Post URL / Thread",
         "Url": "Post URL / Thread",
         "Post URL / Thread": "Post URL / Thread",
-
         "Total views": "Views",
         "Views": "Views",
         "View Count": "Views",
         "Play Count": "Views",
         "plays": "Views",
-
         "Total likes": "Likes",
         "Likes": "Likes",
         "Hearts": "Likes",
         "likes": "Likes",
-
         "Total comment": "Comments",
         "Total comments": "Comments",
         "Comments": "Comments",
         "Replies": "Comments",
         "comments": "Comments",
-
         "Post time": "Published Date",
         "Published Date": "Published Date",
         "Date": "Published Date",
         "Published": "Published Date",
-
-        "Format": "Format",
         "Duration Seconds": "Duration Seconds",
+        "Format": "Format",
         "ER (%)": "ER (%)",
         "ER Tier": "ER Tier",
         "Topic / Content Pillar": "Topic / Content Pillar"
@@ -744,28 +696,13 @@ def standardise_platform_export(df, competitor_name="Uploaded Competitor", fallb
     ]]
 
 
-# =========================================================
-# 6. Prepared competitor workbook reader
-# =========================================================
-
 def read_prepared_competitor_workbook(uploaded_file):
-    """
-    Reads a prepared multi-sheet competitor workbook.
-    Each competitor is usually one sheet.
-    The actual table header can start below the first row.
-    """
     all_frames = []
-
     xls = pd.ExcelFile(uploaded_file)
 
     skip_keywords = [
-        "posting behaviour",
-        "audience",
-        "funnels",
-        "engagement summary",
-        "summary",
-        "notes",
-        "readme"
+        "posting behaviour", "audience", "funnels",
+        "engagement summary", "summary", "notes", "readme"
     ]
 
     for sheet in xls.sheet_names:
@@ -794,75 +731,13 @@ def read_prepared_competitor_workbook(uploaded_file):
 
         df["Competitor"] = sheet
 
-        if "Post URL / Thread" not in df.columns:
-            df["Post URL / Thread"] = ""
+        prepared = standardise_platform_export(
+            df,
+            competitor_name=sheet,
+            fallback_platform="Uploaded"
+        )
 
-        if "Published Date" not in df.columns:
-            df["Published Date"] = ""
-
-        if "Duration Seconds" not in df.columns:
-            df["Duration Seconds"] = None
-
-        if "Format" not in df.columns:
-            df["Format"] = df.apply(
-                lambda row: classify_format(
-                    row.get("Platform"),
-                    row.get("Title / Description"),
-                    row.get("Duration Seconds", None)
-                ),
-                axis=1
-            )
-
-        for col in ["Views", "Likes", "Comments"]:
-            if col not in df.columns:
-                df[col] = 0
-            df[col] = df[col].apply(parse_number)
-
-        if "ER (%)" not in df.columns:
-            df["ER (%)"] = df.apply(
-                lambda row: ((row["Likes"] + row["Comments"]) / row["Views"] * 100)
-                if row["Views"] and row["Views"] > 0 else 0,
-                axis=1
-            )
-        else:
-            df["ER (%)"] = df["ER (%)"].apply(parse_percent)
-            calculated_er = df.apply(
-                lambda row: ((row["Likes"] + row["Comments"]) / row["Views"] * 100)
-                if row["Views"] and row["Views"] > 0 else 0,
-                axis=1
-            )
-            df["ER (%)"] = df["ER (%)"].fillna(calculated_er)
-
-        df["ER (%)"] = df["ER (%)"].round(2)
-
-        if "ER Tier" not in df.columns:
-            df["ER Tier"] = df.apply(
-                lambda row: classify_er_tier(row["Platform"], row["ER (%)"]),
-                axis=1
-            )
-
-        if "Topic / Content Pillar" not in df.columns:
-            df["Topic / Content Pillar"] = df["Title / Description"].apply(classify_topic)
-
-        df = df[[
-            "Competitor",
-            "Platform",
-            "Post URL / Thread",
-            "Title / Description",
-            "Published Date",
-            "Format",
-            "Views",
-            "Likes",
-            "Comments",
-            "ER (%)",
-            "ER Tier",
-            "Topic / Content Pillar"
-        ]]
-
-        df = df[df["Platform"].notna()]
-        df = df[df["Title / Description"].notna()]
-
-        all_frames.append(df)
+        all_frames.append(prepared)
 
     if not all_frames:
         return pd.DataFrame()
@@ -871,7 +746,7 @@ def read_prepared_competitor_workbook(uploaded_file):
 
 
 # =========================================================
-# 7. Comment analysis functions
+# 6. Comment analysis
 # =========================================================
 
 def classify_comment_sentiment(comment):
@@ -1050,9 +925,7 @@ def standardise_comment_upload(df):
 
 
 def generate_comment_summary(comment_df):
-    total_comments = len(comment_df)
-
-    if total_comments == 0:
+    if len(comment_df) == 0:
         return pd.DataFrame({
             "Dimension": ["Sentiment", "Comment depth", "Main themes", "Questions", "Community behaviour"],
             "Result": ["No comments", "No comments", "No themes", "No questions", "No discussion"]
@@ -1118,7 +991,7 @@ def generate_comment_summary(comment_df):
 
 
 # =========================================================
-# 8. Sidebar inputs
+# 7. Sidebar inputs
 # =========================================================
 
 st.sidebar.header("YouTube API Collection")
@@ -1127,7 +1000,8 @@ youtube_accounts_text = st.sidebar.text_area(
     "YouTube competitors, one per line",
     value=(
         "Nischa | https://www.youtube.com/@nischa\n"
-        "Damien Talks Money | https://www.youtube.com/@DamienTalksMoney"
+        "Damien Talks Money | https://www.youtube.com/@DamienTalksMoney\n"
+        "Monzo | https://www.youtube.com/@MonzoBank"
     ),
     help="Format: Competitor Name | YouTube Channel URL or Handle"
 )
@@ -1149,8 +1023,8 @@ else:
 days = st.sidebar.slider(
     "Time Window",
     min_value=30,
-    max_value=180,
-    value=90,
+    max_value=365,
+    value=180,
     step=30
 )
 
@@ -1162,10 +1036,10 @@ max_videos = st.sidebar.slider(
     step=10
 )
 
-exclude_shorts = st.sidebar.checkbox(
-    "Exclude YouTube Shorts / very short videos",
+include_shorts = st.sidebar.checkbox(
+    "Include YouTube Shorts / short videos",
     value=True,
-    help="If selected, the dashboard keeps videos longer than 60 seconds."
+    help="If selected, the dashboard includes videos shorter than or equal to 60 seconds."
 )
 
 st.sidebar.markdown("---")
@@ -1175,10 +1049,7 @@ raw_platform_uploads = st.sidebar.file_uploader(
     "Upload raw TikTok / Instagram / other platform exports",
     type=["csv", "xlsx"],
     accept_multiple_files=True,
-    help=(
-        "One row = one post/video. Required columns: title/caption, views, likes, comments. "
-        "File name should include competitor and platform if possible, e.g. Nischa_TikTok.xlsx."
-    )
+    help="Required columns: title/caption, views, likes, comments."
 )
 
 st.sidebar.markdown("---")
@@ -1187,10 +1058,7 @@ st.sidebar.header("Upload Port 2: Prepared Competitor Workbook")
 prepared_workbook_upload = st.sidebar.file_uploader(
     "Upload prepared competitor benchmark workbook",
     type=["xlsx"],
-    help=(
-        "Use this for the workbook with competitor sheets such as Monzo, Nischa or Damien. "
-        "Each sheet should contain a table with Platform, Post URL / Thread, Title / Description, Views, Likes, Comments."
-    )
+    help="Workbook with competitor sheets such as Monzo, Nischa, Damien."
 )
 
 st.sidebar.markdown("---")
@@ -1213,14 +1081,14 @@ comment_uploads = st.sidebar.file_uploader(
     "Upload TikTok / Instagram / other comment files",
     type=["csv", "xlsx"],
     accept_multiple_files=True,
-    help="Required column: Comment. Optional: Competitor, Platform, Sentiment, Theme, Question Type, Comment Depth."
+    help="Required column: Comment."
 )
 
 run_button = st.sidebar.button("Run Analysis")
 
 
 # =========================================================
-# 9. Tabs
+# 8. Tabs
 # =========================================================
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
@@ -1234,7 +1102,7 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 
 
 # =========================================================
-# 10. Run analysis
+# 9. Run analysis
 # =========================================================
 
 if run_button:
@@ -1264,13 +1132,13 @@ if run_button:
                     st.warning(f"{comp_name}: {error}")
                     continue
 
-                with st.spinner(f"Fetching recent YouTube uploads for {comp_name}..."):
+                with st.spinner(f"Fetching YouTube search results for {comp_name}..."):
                     yt_df = fetch_youtube_recent_videos(
                         channel_id=channel_id,
                         api_key=api_key,
                         days=days,
                         max_results=max_videos,
-                        exclude_shorts=exclude_shorts
+                        include_shorts=include_shorts
                     )
 
                 if yt_df.empty:
@@ -1382,7 +1250,7 @@ comment_summary = st.session_state.get("comment_summary", None)
 
 
 # =========================================================
-# 11. Render tab 1: Benchmark Tables
+# 10. Render tabs
 # =========================================================
 
 with tab1:
@@ -1418,10 +1286,6 @@ with tab1:
     else:
         st.info("Run analysis to generate benchmark tables.")
 
-
-# =========================================================
-# 12. Render tab 2: Performance Summary
-# =========================================================
 
 with tab2:
     st.subheader("Performance Summary")
@@ -1487,10 +1351,6 @@ with tab2:
         st.info("Run analysis to see performance summary.")
 
 
-# =========================================================
-# 13. Render tab 3: Topic Analysis
-# =========================================================
-
 with tab3:
     st.subheader("Topic / Content Pillar Analysis")
 
@@ -1508,30 +1368,6 @@ with tab3:
 
         st.dataframe(topic_summary, width="stretch")
 
-        col_a, col_b = st.columns(2)
-
-        with col_a:
-            fig_topic_views = px.bar(
-                topic_summary.sort_values("Avg_Views", ascending=False),
-                x="Topic / Content Pillar",
-                y="Avg_Views",
-                color="Competitor",
-                title="Average Views by Topic"
-            )
-            st.plotly_chart(fig_topic_views, width="stretch")
-
-        with col_b:
-            fig_topic_er = px.bar(
-                topic_summary.sort_values("Avg_ER", ascending=False),
-                x="Topic / Content Pillar",
-                y="Avg_ER",
-                color="Competitor",
-                title="Average ER by Topic"
-            )
-            st.plotly_chart(fig_topic_er, width="stretch")
-
-        st.markdown("### Format Summary")
-
         format_summary = benchmark.groupby(["Competitor", "Platform", "Format"]).agg(
             Posts=("Title / Description", "count"),
             Avg_Views=("Views", "mean"),
@@ -1543,15 +1379,12 @@ with tab3:
         format_summary["Avg_ER"] = format_summary["Avg_ER"].round(2)
         format_summary["Avg_Comments"] = format_summary["Avg_Comments"].round(1)
 
+        st.markdown("### Format Summary")
         st.dataframe(format_summary, width="stretch")
 
     else:
         st.info("Run analysis to see topic analysis.")
 
-
-# =========================================================
-# 14. Render tab 4: Comment Analysis
-# =========================================================
 
 with tab4:
     st.subheader("Comment Analysis")
@@ -1592,63 +1425,9 @@ with tab4:
             mime="text/csv"
         )
 
-        csv_summary = comment_summary.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download comment summary as CSV",
-            data=csv_summary,
-            file_name="comment_summary.csv",
-            mime="text/csv"
-        )
-
-        st.markdown("### Comment Distribution")
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            sentiment_chart = comments_df["Sentiment"].value_counts().reset_index()
-            sentiment_chart.columns = ["Sentiment", "Count"]
-
-            fig_sentiment = px.bar(
-                sentiment_chart,
-                x="Sentiment",
-                y="Count",
-                title="Comment Sentiment Distribution"
-            )
-            st.plotly_chart(fig_sentiment, width="stretch")
-
-        with col2:
-            depth_chart = comments_df["Comment Depth"].value_counts().reset_index()
-            depth_chart.columns = ["Comment Depth", "Count"]
-
-            fig_depth = px.bar(
-                depth_chart,
-                x="Comment Depth",
-                y="Count",
-                title="Comment Depth Distribution"
-            )
-            st.plotly_chart(fig_depth, width="stretch")
-
-        theme_chart = comments_df["Theme"].value_counts().reset_index()
-        theme_chart.columns = ["Theme", "Count"]
-
-        fig_theme = px.bar(
-            theme_chart,
-            x="Theme",
-            y="Count",
-            title="Main Comment Themes"
-        )
-        st.plotly_chart(fig_theme, width="stretch")
-
     else:
-        st.info(
-            "Run YouTube analysis with automatic comment fetching, "
-            "or upload TikTok / Instagram / other comment files."
-        )
+        st.info("Run YouTube analysis with automatic comment fetching, or upload comment files.")
 
-
-# =========================================================
-# 15. Render tab 5: Competitor Comparison Matrix
-# =========================================================
 
 with tab5:
     st.subheader("Competitor Comparison Matrix")
@@ -1791,10 +1570,6 @@ with tab5:
         st.info("Run analysis to generate competitor comparison matrix.")
 
 
-# =========================================================
-# 16. Render tab 6: Sharing / Deployment Notes
-# =========================================================
-
 with tab6:
     st.subheader("Sharing / Deployment Notes")
 
@@ -1807,13 +1582,12 @@ with tab6:
         Required fields: title/caption, views, likes, comments.
 
         **Upload Port 2: Prepared Competitor Benchmark Workbook**  
-        Use this for a prepared workbook where each competitor has a sheet, such as Monzo, Nischa or Damien.  
+        Use this for a prepared workbook where each competitor has a sheet.  
         The table header should contain: Platform, Post URL / Thread, Title / Description, Views, Likes, Comments.
 
         **Upload Port 3: Comment Files**  
         Use this for TikTok / Instagram / other platform comment files.  
-        Required field: Comment.  
-        Optional fields: Competitor, Platform, Sentiment, Theme, Question Type, Comment Depth.
+        Required field: Comment.
 
         ### YouTube API Key
 
@@ -1825,22 +1599,12 @@ with tab6:
 
         If no secret is found, users can manually paste an API key in the sidebar.
 
-        ### Deployment
+        ### Recommended YouTube input format
 
-        Required files:
-        - `app.py`
-        - `requirements.txt`
-
-        Suggested `requirements.txt`:
         ```
-        streamlit
-        pandas
-        requests
-        plotly
-        isodate
-        openpyxl
+        Monzo | https://www.youtube.com/@MonzoBank
+        Nischa | https://www.youtube.com/@nischa
+        Damien Talks Money | https://www.youtube.com/@DamienTalksMoney
         ```
-
-        Do not put your API key directly into the code before uploading to GitHub.
         """
     )
