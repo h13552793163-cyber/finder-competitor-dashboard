@@ -165,14 +165,23 @@ def parse_youtube_accounts(text):
 
         if "|" in line:
             name, url = line.split("|", 1)
-            accounts.append({
-                "competitor": name.strip(),
-                "youtube_input": url.strip()
-            })
+            name = name.strip()
+            url = url.strip()
+
+            if not name or not url:
+                accounts.append({
+                    "competitor": name if name else line,
+                    "youtube_input": ""
+                })
+            else:
+                accounts.append({
+                    "competitor": name,
+                    "youtube_input": url
+                })
         else:
             accounts.append({
-                "competitor": line.strip(),
-                "youtube_input": line.strip()
+                "competitor": line,
+                "youtube_input": line
             })
 
     return accounts
@@ -238,38 +247,103 @@ def resolve_youtube_channel_id(channel_input: str, api_key: str):
     return items[0]["snippet"]["channelId"], None
 
 
-def fetch_youtube_recent_videos(channel_id: str, api_key: str, days: int = 90, max_results: int = 50):
-    published_after = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+def get_uploads_playlist_id(channel_id: str, api_key: str):
+    """
+    Get the uploads playlist ID for a YouTube channel.
+    This is more reliable than search.list for collecting channel videos.
+    """
+    url = "https://www.googleapis.com/youtube/v3/channels"
+    params = {
+        "part": "contentDetails",
+        "id": channel_id,
+        "key": api_key
+    }
+
+    response = requests.get(url, params=params, timeout=20)
+    data = response.json()
+
+    if response.status_code != 200:
+        raise RuntimeError(data.get("error", {}).get("message", "YouTube API error."))
+
+    items = data.get("items", [])
+    if not items:
+        return None
+
+    return items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
+
+
+def fetch_youtube_recent_videos(
+    channel_id: str,
+    api_key: str,
+    days: int = 90,
+    max_results: int = 50,
+    exclude_shorts: bool = True
+):
+    """
+    Fetch recent uploads from a YouTube channel using the channel uploads playlist.
+    This is more stable than search.list and avoids wrong search results.
+    """
+    uploads_playlist_id = get_uploads_playlist_id(channel_id, api_key)
+
+    if not uploads_playlist_id:
+        return pd.DataFrame()
+
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
 
     video_ids = []
     next_page_token = None
 
     while len(video_ids) < max_results:
-        search_url = "https://www.googleapis.com/youtube/v3/search"
-        search_params = {
-            "part": "snippet",
-            "channelId": channel_id,
-            "type": "video",
-            "order": "date",
-            "publishedAfter": published_after,
+        playlist_url = "https://www.googleapis.com/youtube/v3/playlistItems"
+        playlist_params = {
+            "part": "snippet,contentDetails",
+            "playlistId": uploads_playlist_id,
             "maxResults": min(50, max_results - len(video_ids)),
             "key": api_key
         }
 
         if next_page_token:
-            search_params["pageToken"] = next_page_token
+            playlist_params["pageToken"] = next_page_token
 
-        response = requests.get(search_url, params=search_params, timeout=20)
+        response = requests.get(playlist_url, params=playlist_params, timeout=20)
         data = response.json()
 
         if response.status_code != 200:
             raise RuntimeError(data.get("error", {}).get("message", "YouTube API error."))
 
-        for item in data.get("items", []):
-            video_ids.append(item["id"]["videoId"])
+        items = data.get("items", [])
+        if not items:
+            break
+
+        stop_due_to_date = False
+
+        for item in items:
+            snippet = item.get("snippet", {})
+            content = item.get("contentDetails", {})
+
+            published_at = snippet.get("publishedAt", "")
+
+            try:
+                published_dt = datetime.fromisoformat(
+                    published_at.replace("Z", "+00:00")
+                )
+            except Exception:
+                published_dt = None
+
+            if published_dt and published_dt < cutoff_date:
+                stop_due_to_date = True
+                continue
+
+            video_id = content.get("videoId")
+            if video_id:
+                video_ids.append(video_id)
+
+            if len(video_ids) >= max_results:
+                break
 
         next_page_token = data.get("nextPageToken")
-        if not next_page_token:
+
+        if not next_page_token or stop_due_to_date:
             break
 
     if not video_ids:
@@ -304,7 +378,10 @@ def fetch_youtube_recent_videos(channel_id: str, api_key: str, days: int = 90, m
             try:
                 duration_seconds = int(isodate.parse_duration(duration_iso).total_seconds())
             except Exception:
-                duration_seconds = None
+                duration_seconds = 0
+
+            if exclude_shorts and duration_seconds <= 60:
+                continue
 
             rows.append({
                 "Platform": "YouTube",
@@ -476,6 +553,8 @@ def classify_format(platform, title, duration_seconds=None):
             return "Short video"
         if duration_seconds <= 180:
             return "Short / Under 3 mins"
+        if duration_seconds <= 600:
+            return "Medium / 3–10 mins"
         return "Long-form video"
 
     return "General Video"
@@ -574,6 +653,7 @@ def standardise_platform_export(df, competitor_name="Uploaded Competitor", fallb
         "Published": "Published Date",
 
         "Format": "Format",
+        "Duration Seconds": "Duration Seconds",
         "ER (%)": "ER (%)",
         "ER Tier": "ER Tier",
         "Topic / Content Pillar": "Topic / Content Pillar"
@@ -606,12 +686,19 @@ def standardise_platform_export(df, competitor_name="Uploaded Competitor", fallb
     if "Published Date" not in df.columns:
         df["Published Date"] = ""
 
+    if "Duration Seconds" not in df.columns:
+        df["Duration Seconds"] = None
+
     for col in ["Views", "Likes", "Comments"]:
         df[col] = df[col].apply(parse_number)
 
     if "Format" not in df.columns:
         df["Format"] = df.apply(
-            lambda row: classify_format(row.get("Platform"), row.get("Title / Description")),
+            lambda row: classify_format(
+                row.get("Platform"),
+                row.get("Title / Description"),
+                row.get("Duration Seconds", None)
+            ),
             axis=1
         )
 
@@ -713,9 +800,16 @@ def read_prepared_competitor_workbook(uploaded_file):
         if "Published Date" not in df.columns:
             df["Published Date"] = ""
 
+        if "Duration Seconds" not in df.columns:
+            df["Duration Seconds"] = None
+
         if "Format" not in df.columns:
             df["Format"] = df.apply(
-                lambda row: classify_format(row.get("Platform"), row.get("Title / Description")),
+                lambda row: classify_format(
+                    row.get("Platform"),
+                    row.get("Title / Description"),
+                    row.get("Duration Seconds", None)
+                ),
                 axis=1
             )
 
@@ -857,40 +951,31 @@ def standardise_comment_upload(df):
     rename_map = {
         "Competitor": "Competitor",
         "competitor": "Competitor",
-
         "Platform": "Platform",
         "platform": "Platform",
-
         "Video ID": "Video ID",
         "Video id": "Video ID",
         "video_id": "Video ID",
-
         "Comment": "Comment",
         "comment": "Comment",
         "Text": "Comment",
         "text": "Comment",
-
         "Comment Likes": "Comment Likes",
         "Likes": "Comment Likes",
         "likes": "Comment Likes",
-
         "Published": "Published",
         "Date": "Published",
         "Published Date": "Published",
         "published_at": "Published",
-
         "Author": "Author",
         "Username": "Author",
         "User": "Author",
         "author": "Author",
-
         "Title": "Title",
         "Video Title": "Title",
-
         "Url": "Url",
         "URL": "Url",
         "Video URL": "Url",
-
         "Sentiment": "Sentiment",
         "Theme": "Theme",
         "Question": "Question Type",
@@ -1077,6 +1162,12 @@ max_videos = st.sidebar.slider(
     step=10
 )
 
+exclude_shorts = st.sidebar.checkbox(
+    "Exclude YouTube Shorts / very short videos",
+    value=True,
+    help="If selected, the dashboard keeps videos longer than 60 seconds."
+)
+
 st.sidebar.markdown("---")
 st.sidebar.header("Upload Port 1: Raw Platform Exports")
 
@@ -1147,19 +1238,23 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 # =========================================================
 
 if run_button:
-    all_data = []
+    st.session_state.pop("benchmark", None)
+    st.session_state.pop("comments_df", None)
+    st.session_state.pop("comment_summary", None)
 
+    all_data = []
     api_key = manual_api_key.strip() if manual_api_key else default_key
 
-    # -----------------------------
-    # YouTube API collection
-    # -----------------------------
     youtube_accounts = parse_youtube_accounts(youtube_accounts_text)
 
     if youtube_accounts and api_key:
         for account in youtube_accounts:
             comp_name = account["competitor"]
             yt_input = account["youtube_input"]
+
+            if not yt_input:
+                st.warning(f"{comp_name}: No YouTube channel input provided.")
+                continue
 
             try:
                 with st.spinner(f"Resolving YouTube channel for {comp_name}..."):
@@ -1169,12 +1264,13 @@ if run_button:
                     st.warning(f"{comp_name}: {error}")
                     continue
 
-                with st.spinner(f"Fetching recent YouTube videos for {comp_name}..."):
+                with st.spinner(f"Fetching recent YouTube uploads for {comp_name}..."):
                     yt_df = fetch_youtube_recent_videos(
                         channel_id=channel_id,
                         api_key=api_key,
                         days=days,
-                        max_results=max_videos
+                        max_results=max_videos,
+                        exclude_shorts=exclude_shorts
                     )
 
                 if yt_df.empty:
@@ -1194,9 +1290,6 @@ if run_button:
     elif youtube_accounts and not api_key:
         st.warning("No YouTube API key available. Add it in Streamlit Secrets or enter it manually.")
 
-    # -----------------------------
-    # Upload Port 1: raw platform exports
-    # -----------------------------
     if raw_platform_uploads:
         for uploaded_file in raw_platform_uploads:
             try:
@@ -1215,9 +1308,6 @@ if run_button:
             except Exception as e:
                 st.error(f"Raw platform export upload failed for {uploaded_file.name}: {e}")
 
-    # -----------------------------
-    # Upload Port 2: prepared competitor workbook
-    # -----------------------------
     if prepared_workbook_upload is not None:
         try:
             prepared_df = read_prepared_competitor_workbook(prepared_workbook_upload)
@@ -1230,9 +1320,6 @@ if run_button:
         except Exception as e:
             st.error(f"Prepared competitor workbook upload failed: {e}")
 
-    # -----------------------------
-    # Combine post/video data
-    # -----------------------------
     if all_data:
         benchmark = pd.concat(all_data, ignore_index=True, sort=False)
         benchmark = benchmark.dropna(subset=["Title / Description"], how="any")
@@ -1255,9 +1342,6 @@ if run_button:
     else:
         st.warning("No post/video data collected. Add YouTube API key, upload raw platform exports, or upload a prepared workbook.")
 
-    # -----------------------------
-    # Upload Port 3: comment files
-    # -----------------------------
     if comment_uploads:
         uploaded_comment_frames = []
 
