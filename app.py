@@ -30,6 +30,13 @@ st.caption(
 # =========================================================
 
 def get_secret_api_key():
+    """
+    Priority:
+    1. Streamlit Cloud secrets
+    2. Local environment variable
+
+    The secret key is NOT displayed in the sidebar input.
+    """
     try:
         if "YOUTUBE_API_KEY" in st.secrets:
             return st.secrets["YOUTUBE_API_KEY"]
@@ -127,10 +134,27 @@ def infer_competitor_from_filename(filename):
     return cleaned if cleaned else "Uploaded Competitor"
 
 
+def infer_platform_from_filename(filename):
+    f = filename.lower()
+
+    if "tiktok" in f:
+        return "TikTok"
+    if "instagram" in f or "ig" in f:
+        return "Instagram"
+    if "youtube" in f or "yt" in f:
+        return "YouTube"
+
+    return "Uploaded"
+
+
 def parse_youtube_accounts(text):
     """
     Expected format:
     Competitor Name | YouTube URL or handle
+
+    Example:
+    Nischa | https://www.youtube.com/@nischa
+    Damien Talks Money | https://www.youtube.com/@DamienTalksMoney
     """
     accounts = []
 
@@ -432,6 +456,7 @@ def classify_format(platform, title, duration_seconds=None):
 
     if platform == "tiktok":
         return "Short video"
+
     if platform == "instagram":
         if any(k in t for k in ["reel", "short"]):
             return "Reel"
@@ -598,13 +623,12 @@ def standardise_platform_export(df, competitor_name="Uploaded Competitor", fallb
         )
     else:
         df["ER (%)"] = df["ER (%)"].apply(parse_percent)
-        df["ER (%)"] = df["ER (%)"].fillna(
-            df.apply(
-                lambda row: ((row["Likes"] + row["Comments"]) / row["Views"] * 100)
-                if row["Views"] and row["Views"] > 0 else 0,
-                axis=1
-            )
+        calculated_er = df.apply(
+            lambda row: ((row["Likes"] + row["Comments"]) / row["Views"] * 100)
+            if row["Views"] and row["Views"] > 0 else 0,
+            axis=1
         )
+        df["ER (%)"] = df["ER (%)"].fillna(calculated_er)
 
     df["ER (%)"] = df["ER (%)"].round(2)
 
@@ -631,17 +655,6 @@ def standardise_platform_export(df, competitor_name="Uploaded Competitor", fallb
         "ER Tier",
         "Topic / Content Pillar"
     ]]
-
-
-def infer_platform_from_filename(filename):
-    f = filename.lower()
-    if "tiktok" in f:
-        return "TikTok"
-    if "instagram" in f or "ig" in f:
-        return "Instagram"
-    if "youtube" in f or "yt" in f:
-        return "YouTube"
-    return "Uploaded"
 
 
 # =========================================================
@@ -719,13 +732,12 @@ def read_prepared_competitor_workbook(uploaded_file):
             )
         else:
             df["ER (%)"] = df["ER (%)"].apply(parse_percent)
-            df["ER (%)"] = df["ER (%)"].fillna(
-                df.apply(
-                    lambda row: ((row["Likes"] + row["Comments"]) / row["Views"] * 100)
-                    if row["Views"] and row["Views"] > 0 else 0,
-                    axis=1
-                )
+            calculated_er = df.apply(
+                lambda row: ((row["Likes"] + row["Comments"]) / row["Views"] * 100)
+                if row["Views"] and row["Views"] > 0 else 0,
+                axis=1
             )
+            df["ER (%)"] = df["ER (%)"].fillna(calculated_er)
 
         df["ER (%)"] = df["ER (%)"].round(2)
 
@@ -1038,11 +1050,16 @@ youtube_accounts_text = st.sidebar.text_area(
 default_key = get_secret_api_key()
 
 manual_api_key = st.sidebar.text_input(
-    "YouTube API Key",
-    value=default_key if default_key else "",
+    "YouTube API Key optional override",
+    value="",
     type="password",
-    help="Paste your YouTube Data API key here. On Streamlit Cloud, store this in Secrets instead."
+    help="Leave blank if the app already has a YouTube API key in Streamlit Secrets."
 )
+
+if default_key:
+    st.sidebar.success("YouTube API key loaded from Streamlit Secrets.")
+else:
+    st.sidebar.info("No Streamlit Secret detected. Enter a YouTube API key manually if needed.")
 
 days = st.sidebar.slider(
     "Time Window",
@@ -1080,7 +1097,7 @@ prepared_workbook_upload = st.sidebar.file_uploader(
     "Upload prepared competitor benchmark workbook",
     type=["xlsx"],
     help=(
-        "Use this for the workbook with competitor sheets such as Monzo, Nischa, Damien. "
+        "Use this for the workbook with competitor sheets such as Monzo, Nischa or Damien. "
         "Each sheet should contain a table with Platform, Post URL / Thread, Title / Description, Views, Likes, Comments."
     )
 )
@@ -1131,7 +1148,8 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 
 if run_button:
     all_data = []
-    api_key = manual_api_key.strip() if manual_api_key else None
+
+    api_key = manual_api_key.strip() if manual_api_key else default_key
 
     # -----------------------------
     # YouTube API collection
@@ -1174,7 +1192,7 @@ if run_button:
                 st.error(f"YouTube collection failed for {comp_name}: {e}")
 
     elif youtube_accounts and not api_key:
-        st.warning("Please provide a YouTube API key to fetch YouTube data.")
+        st.warning("No YouTube API key available. Add it in Streamlit Secrets or enter it manually.")
 
     # -----------------------------
     # Upload Port 1: raw platform exports
@@ -1713,6 +1731,16 @@ with tab6:
         Required field: Comment.  
         Optional fields: Competitor, Platform, Sentiment, Theme, Question Type, Comment Depth.
 
+        ### YouTube API Key
+
+        The app first checks Streamlit Secrets:
+
+        ```
+        YOUTUBE_API_KEY = "your_api_key_here"
+        ```
+
+        If no secret is found, users can manually paste an API key in the sidebar.
+
         ### Deployment
 
         Required files:
@@ -1727,14 +1755,6 @@ with tab6:
         plotly
         isodate
         openpyxl
-        ```
-
-        To deploy online:
-        1. Upload `app.py` and `requirements.txt` to GitHub.
-        2. Deploy through Streamlit Community Cloud.
-        3. Add your YouTube key in Streamlit Secrets:
-        ```
-        YOUTUBE_API_KEY = "your_api_key_here"
         ```
 
         Do not put your API key directly into the code before uploading to GitHub.
