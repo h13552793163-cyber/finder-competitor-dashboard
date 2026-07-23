@@ -4,3 +4,6 @@ requests
 plotly
 isodate
 openpyxl
+scikit-learn
+numpy
+openai
