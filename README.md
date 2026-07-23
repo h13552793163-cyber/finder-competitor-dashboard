@@ -8,6 +8,15 @@ It helps marketing and business teams monitor competitors, analyze social media 
 
 ---
 
+### Key Capabilities
+
+- Compare competitors across multiple metrics
+- Automatically summarize competitor activities using AI
+- Generate marketing recommendations
+- Interactive dashboard built with Streamlit
+
+---
+
 ## Features
 
 - Competitor benchmarking
